@@ -1,8 +1,15 @@
-from collections import defaultdict
+import fcntl
 import glob
 import json
 import os
+import pickle
 import warnings
+from collections import defaultdict
+from collections.abc import ValuesView
+from contextlib import ExitStack
+from logging import getLogger
+from pathlib import Path
+from typing import BinaryIO
 
 from .metrics import Gauge
 from .metrics_core import Metric
@@ -15,9 +22,25 @@ try:  # Python3
 except NameError:  # Python >= 2.5
     FileNotFoundError = IOError
 
+log = getLogger(__name__)
+
+
+def reduce_metrics(*metrics: dict[str, Metric]) -> dict[str, Metric]:
+    """Merge multiple dicts of metrics into a single dict, by extending the samples of metrics with the same name."""
+    result = {}
+    for metric_dict in metrics:
+        for name, metric in metric_dict.items():
+            try:
+                result[name].samples.extend(metric.samples)
+            except KeyError:  # noqa: PERF203
+                result[name] = metric
+    return result
+
 
 class MultiProcessCollector:
     """Collector for files for multi-process mode."""
+
+    MERGED_METRICS_FILENAME = "merged_metrics.pkl"
 
     def __init__(self, registry, path=None):
         if path is None:
@@ -33,7 +56,7 @@ class MultiProcessCollector:
             registry.register(self)
 
     @staticmethod
-    def merge(files, accumulate=True):
+    def merge(files, accumulate=True) -> ValuesView[Metric]:
         """Merge metrics from given mmap files.
 
         By default, histograms are accumulated, as per prometheus wire format.
@@ -44,7 +67,8 @@ class MultiProcessCollector:
         return MultiProcessCollector._accumulate_metrics(metrics, accumulate)
 
     @staticmethod
-    def _read_metrics(files):
+    def _read_metrics(files) -> dict[str, Metric]:
+        # read all .db files and collect all samples for same metric together
         metrics = {}
         key_cache = {}
 
@@ -86,7 +110,8 @@ class MultiProcessCollector:
         return metrics
 
     @staticmethod
-    def _accumulate_metrics(metrics, accumulate):
+    def _accumulate_metrics(metrics: dict[str, Metric], accumulate: bool) -> ValuesView[Metric]:
+        # refactor (accumulate) samples in each metrics object
         for metric in metrics.values():
             samples = defaultdict(lambda: defaultdict(float))
             sample_timestamps = defaultdict(lambda: defaultdict(float))
@@ -166,9 +191,70 @@ class MultiProcessCollector:
                     metric.samples.append(Sample(name_, dict(labels), value))
         return metrics.values()
 
-    def collect(self):
-        files = glob.glob(os.path.join(self._path, '*.db'))
-        return self.merge(files, accumulate=True)
+    def collect(self, recursively: bool = True) -> ValuesView[Metric]:
+        """
+        Collect metrics from all .db files, merge them with existing merged metrics and return the result.
+        """
+        folder = Path(self._path)
+        current_metrics: dict[str, Metric] = self._read_metrics(file.name for file in folder.glob('**/*.db' if recursively else '*.db'))
+        merged_metrics: list[dict[str, Metric]] = [
+            pickle.loads(file.read_bytes())
+            for file in folder.glob(f"**/{self.MERGED_METRICS_FILENAME}" if recursively else self.MERGED_METRICS_FILENAME)
+        ]
+
+        reduced_metrics = reduce_metrics(current_metrics, *merged_metrics)
+        return self._accumulate_metrics(reduced_metrics, accumulate=True)
+
+    def cleanup(self) -> None:
+        """
+        Collect all stale `.db` files and merge them into single merged metrics file.
+        """
+        folder = Path(self._path)
+
+        with ExitStack() as exit_stack:
+            merged_file = (folder / self.MERGED_METRICS_FILENAME).open("r+b")
+            exit_stack.enter_context(merged_file)
+
+            try:
+                fcntl.flock(merged_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log.debug("Could not acquire lock on merged metrics file, skipping cleanup")
+                return
+
+            files_to_merge: list[BinaryIO] = []
+            for file_path in folder.glob('*.db'):
+                file = file_path.open('rb')
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    log.debug("Could not acquire lock on file %s, skipping it", file_path)
+                    file.close()
+                    continue
+                exit_stack.enter_context(file)
+                files_to_merge.append(file)
+
+            if not files_to_merge:
+                return
+
+            # read all .db files and collect all samples for same metric together
+            current_metrics: dict[str, Metric] = self._read_metrics(file.name for file in files_to_merge)
+
+            # load existing merged metrics, if any
+            merged_data = merged_file.read()
+            merged_metrics = pickle.loads(merged_data) if merged_data else {}
+
+            # extend existing merged metrics with current ones
+            reduced_metrics = reduce_metrics(merged_metrics, current_metrics)
+
+            # now collapse samples in merged metrics
+            self._accumulate_metrics(reduced_metrics, accumulate=True)
+
+            merged_file.seek(0)
+            pickle.dump(reduced_metrics, merged_file)
+            merged_file.truncate()
+
+            for file in files_to_merge:
+                Path(file.name).unlink()
 
 
 _LIVE_GAUGE_MULTIPROCESS_MODES = {m for m in Gauge._MULTIPROC_MODES if m.startswith('live')}
