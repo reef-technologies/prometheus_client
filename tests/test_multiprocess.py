@@ -590,6 +590,95 @@ class TestMultiProcess(unittest.TestCase):
         self.assertEqual(child.context['subsystem'], 'api')
         self.assertEqual(child.context['unit'], 'seconds')
 
+    def test_cleanup_creates_merged_file_and_removes_stale_db(self):
+        # Simulate a stale counter .db file (no process holds it locked)
+        stale_fname = os.path.join(self.tempdir, 'counter_9001.db')
+        key = mmap_dict.mmap_key('c', 'c_total', [], [], 'help')
+        d = mmap_dict.MmapedDict(stale_fname)
+        d.write_value(key, 7.0, 0.0)
+        d.close()
+
+        self.collector.cleanup()
+
+        merged_path = os.path.join(self.tempdir, MultiProcessCollector.MERGED_METRICS_FILENAME)
+        self.assertTrue(os.path.exists(merged_path))
+        # The stale .db file should have been removed
+        self.assertFalse(os.path.exists(stale_fname))
+        # The merged data should still be queryable
+        self.assertEqual(7, self.registry.get_sample_value('c_total'))
+
+    def test_cleanup_merges_into_existing_merged_file(self):
+        # First batch of stale metrics
+        stale1 = os.path.join(self.tempdir, 'counter_9001.db')
+        key = mmap_dict.mmap_key('c', 'c_total', [], [], 'help')
+        d = mmap_dict.MmapedDict(stale1)
+        d.write_value(key, 3.0, 0.0)
+        d.close()
+        self.collector.cleanup()
+
+        # Second batch of stale metrics
+        stale2 = os.path.join(self.tempdir, 'counter_9002.db')
+        d = mmap_dict.MmapedDict(stale2)
+        d.write_value(key, 4.0, 0.0)
+        d.close()
+        self.collector.cleanup()
+
+        # Both batches should be visible (3 + 4 = 7)
+        self.assertEqual(7, self.registry.get_sample_value('c_total'))
+        self.assertEqual(glob.glob(os.path.join(self.tempdir, '*.db')), [])
+
+    def test_cleanup_does_not_remove_locked_files(self):
+        # Create a live counter (file is locked by the active MmapedValue)
+        c = Counter('c', 'help', registry=None)
+        c.inc(5)
+
+        # cleanup() should skip the locked file
+        self.collector.cleanup()
+
+        # The .db file should still be present
+        db_files = glob.glob(os.path.join(self.tempdir, '*.db'))
+        self.assertEqual(len(db_files), 1)
+        # Value still accessible via the active .db file
+        self.assertEqual(5, self.registry.get_sample_value('c_total'))
+
+    def test_collect_reads_merged_file_alongside_db_files(self):
+        # Create a stale counter that gets merged
+        stale_fname = os.path.join(self.tempdir, 'counter_9001.db')
+        key = mmap_dict.mmap_key('c', 'c_total', [], [], 'help')
+        d = mmap_dict.MmapedDict(stale_fname)
+        d.write_value(key, 10.0, 0.0)
+        d.close()
+        self.collector.cleanup()
+
+        # Also have a live counter for pid 123
+        c = Counter('c', 'help', registry=None)
+        c.inc(3)
+
+        # collect() must sum both the merged file and the live .db file
+        self.assertEqual(13, self.registry.get_sample_value('c_total'))
+
+    def test_cleanup_histogram_no_double_accumulation(self):
+        # Simulate a stale histogram: one observation of 0.7 falls in the le=0.75 bucket
+        stale_fname = os.path.join(self.tempdir, 'histogram_9001.db')
+        d = mmap_dict.MmapedDict(stale_fname)
+        from prometheus_client.utils import floatToGoString
+        for bound in Histogram.DEFAULT_BUCKETS:
+            le_str = floatToGoString(bound)
+            key = mmap_dict.mmap_key('h', 'h_bucket', ['le'], [le_str], 'help')
+            # The 0.75 bucket holds the single observation (non-cumulative storage)
+            d.write_value(key, 1.0 if le_str == '0.75' else 0.0, 0.0)
+        key = mmap_dict.mmap_key('h', 'h_count', [], [], 'help')
+        d.write_value(key, 1.0, 0.0)
+        key = mmap_dict.mmap_key('h', 'h_sum', [], [], 'help')
+        d.write_value(key, 0.7, 0.0)
+        d.close()
+
+        self.collector.cleanup()
+
+        # After cleanup + collect, le=1.0 bucket should be 1 (cumulative), not 2
+        self.assertEqual(1, self.registry.get_sample_value('h_bucket', {'le': '1.0'}))
+        self.assertEqual(1, self.registry.get_sample_value('h_count'))
+
 
 class TestMmapedDict(unittest.TestCase):
     def setUp(self):

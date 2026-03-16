@@ -196,11 +196,14 @@ class MultiProcessCollector:
         Collect metrics from all .db files, merge them with existing merged metrics and return the result.
         """
         folder = Path(self._path)
-        current_metrics: dict[str, Metric] = self._read_metrics(file.name for file in folder.glob('**/*.db' if recursively else '*.db'))
-        merged_metrics: list[dict[str, Metric]] = [
-            pickle.loads(file.read_bytes())
-            for file in folder.glob(f"**/{self.MERGED_METRICS_FILENAME}" if recursively else self.MERGED_METRICS_FILENAME)
-        ]
+        current_metrics: dict[str, Metric] = self._read_metrics(
+            str(file) for file in folder.glob('**/*.db' if recursively else '*.db')
+        )
+        merged_metrics: list[dict[str, Metric]] = []
+        for merged_file in folder.glob(f"**/{self.MERGED_METRICS_FILENAME}" if recursively else self.MERGED_METRICS_FILENAME):
+            data = merged_file.read_bytes()
+            if data:
+                merged_metrics.append(pickle.loads(data))
 
         reduced_metrics = reduce_metrics(current_metrics, *merged_metrics)
         return self._accumulate_metrics(reduced_metrics, accumulate=True)
@@ -212,7 +215,9 @@ class MultiProcessCollector:
         folder = Path(self._path)
 
         with ExitStack() as exit_stack:
-            merged_file = (folder / self.MERGED_METRICS_FILENAME).open("r+b")
+            merged_file_path = folder / self.MERGED_METRICS_FILENAME
+            merged_file_path.touch(exist_ok=True)
+            merged_file = merged_file_path.open("r+b")
             exit_stack.enter_context(merged_file)
 
             try:
@@ -243,11 +248,8 @@ class MultiProcessCollector:
             merged_data = merged_file.read()
             merged_metrics = pickle.loads(merged_data) if merged_data else {}
 
-            # extend existing merged metrics with current ones
+            # extend existing merged metrics with current ones; accumulation happens at collect time
             reduced_metrics = reduce_metrics(merged_metrics, current_metrics)
-
-            # now collapse samples in merged metrics
-            self._accumulate_metrics(reduced_metrics, accumulate=True)
 
             merged_file.seek(0)
             pickle.dump(reduced_metrics, merged_file)
