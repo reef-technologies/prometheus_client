@@ -1,6 +1,6 @@
 import fcntl
-import os
 from logging import getLogger
+import os
 from threading import Lock
 import warnings
 

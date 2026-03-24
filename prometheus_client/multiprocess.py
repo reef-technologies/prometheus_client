@@ -1,15 +1,15 @@
-import fcntl
-import glob
-import json
-import os
-import pickle
-import warnings
 from collections import defaultdict
 from collections.abc import ValuesView
 from contextlib import ExitStack
+import fcntl
+import glob
+import json
 from logging import getLogger
+import os
 from pathlib import Path
+import pickle
 from typing import BinaryIO
+import warnings
 
 from .metrics import Gauge
 from .metrics_core import Metric
@@ -244,7 +244,10 @@ class MultiProcessCollector:
 
             # load existing merged metrics, if any
             merged_data = merged_file.read()
-            merged_metrics = pickle.loads(merged_data) if merged_data else {}
+            try:
+                merged_metrics = pickle.loads(merged_data) if merged_data else {}
+            except (pickle.PickleError, EOFError):
+                merged_metrics = {}
 
             # extend existing merged metrics with current ones
             reduced_metrics = reduce_metrics(merged_metrics, current_metrics)
