@@ -1,10 +1,12 @@
 import glob
 from itertools import chain
+from multiprocessing import Process
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from time import sleep
 import unittest
 import warnings
 
@@ -48,6 +50,12 @@ class TestMultiProcessDeprecation(unittest.TestCase):
         # Just test that this does not raise with a lowercase env var. The
         # logic is tested elsewhere.
         mark_process_dead(123)
+
+
+def e2e_worker():
+    c = Counter('c', 'help', registry=None)
+    c.inc()
+    sleep(100)
 
 
 class TestMultiProcess(unittest.TestCase):
@@ -703,6 +711,39 @@ class TestMultiProcess(unittest.TestCase):
             multiproc_path / 'counter_2.db',
             multiproc_path / self.collector.MERGED_METRICS_FILENAME,
         ])
+
+    def test_collection_e2e(self):
+        NUM_PROCESSES = 5
+        NUM_ALIVE_PROCESSES = 3
+        multiproc_path = Path(self.tempdir)
+
+        processes = [Process(target=e2e_worker) for _ in range(NUM_PROCESSES)]
+        for p in processes:
+            p.start()
+
+        sleep(2)
+
+        # current process is a collector
+        files = list(multiproc_path.glob('*.db'))
+        self.assertEqual(len(files), NUM_PROCESSES)
+
+        metrics_before = self.collector.collect()
+        for p in processes[NUM_ALIVE_PROCESSES:]:
+            p.terminate()
+        sleep(2)
+
+        self.collector.cleanup()
+        files = list(multiproc_path.glob('*.db'))
+        self.assertEqual(len(files), NUM_ALIVE_PROCESSES)
+        self.assertTrue((multiproc_path / self.collector.MERGED_METRICS_FILENAME).exists())
+        metrics_after = self.collector.collect()
+
+        for metric in chain(metrics_before, metrics_after):
+            metric.samples[:] = sorted(metric.samples, key=lambda s: sorted(s.labels.items()))
+        self.assertEqual(list(metrics_before), list(metrics_after))
+
+        for p in processes[:NUM_ALIVE_PROCESSES]:
+            p.terminate()
 
 
 class TestMmapedDict(unittest.TestCase):
