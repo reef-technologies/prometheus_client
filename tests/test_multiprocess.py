@@ -484,7 +484,7 @@ class TestMultiProcess(unittest.TestCase):
             assert "Removal of labels has not been implemented" in str(w[0].message)
             assert issubclass(w[-1].category, UserWarning)
             assert "Clearing labels has not been implemented" in str(w[-1].message)
-    
+
     def test_child_name_is_built_once_with_namespace_subsystem_unit(self):
         """
         Repro for #1035:
@@ -679,7 +679,7 @@ class TestFlockMultiProcess(unittest.TestCase):
         ])
         metrics_before = self.collector.collect()
 
-        self.collector.cleanup()
+        self.collector.cleanup(self.multiproc_path)
         files = list(self.multiproc_path.glob('*'))
         self.assertEqual(sorted(files), [
             self.multiproc_path / 'counter_1.db',
@@ -705,7 +705,7 @@ class TestFlockMultiProcess(unittest.TestCase):
         c2 = Counter('c', 'help', registry=None)
         c2.inc(2)
 
-        self.collector.cleanup()
+        self.collector.cleanup(self.multiproc_path)
         assert (self.multiproc_path / self.collector.MERGED_METRICS_FILENAME).exists()
 
         values.ValueClass = MultiProcessValue(lambda: 3)
@@ -715,7 +715,7 @@ class TestFlockMultiProcess(unittest.TestCase):
         del c3
 
         metrics_before = self.collector.collect()
-        self.collector.cleanup()
+        self.collector.cleanup(self.multiproc_path)
         metrics_after = self.collector.collect()
 
         for metric in chain(metrics_before, metrics_after):
@@ -746,7 +746,7 @@ class TestFlockMultiProcess(unittest.TestCase):
         sleep(2)
 
         assert len(list(self.multiproc_path.glob('*.db'))) == NUM_PROCESSES
-        self.collector.cleanup()
+        self.collector.cleanup(self.multiproc_path)
         files = list(self.multiproc_path.glob('*.db'))
         self.assertEqual(len(files), NUM_ALIVE_PROCESSES)
         self.assertTrue((self.multiproc_path / self.collector.MERGED_METRICS_FILENAME).exists())

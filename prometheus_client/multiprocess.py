@@ -213,14 +213,14 @@ class FlockMultiProcessCollector(MultiProcessCollector):
         reduced_metrics = reduce_metrics(current_metrics, *merged_metrics)
         return self._accumulate_metrics(reduced_metrics, accumulate=True)
 
-    def cleanup(self) -> None:
+    @classmethod
+    def cleanup(cls, folder: Path) -> None:
         """
         Collect all stale `.db` files and merge them into single merged metrics file.
         """
-        folder = Path(self._path)
 
         with ExitStack() as exit_stack:
-            merged_file_path = folder / self.MERGED_METRICS_FILENAME
+            merged_file_path = folder / cls.MERGED_METRICS_FILENAME
             merged_file_path.touch(exist_ok=True)
             merged_file = merged_file_path.open("r+b")
             exit_stack.enter_context(merged_file)
@@ -247,7 +247,7 @@ class FlockMultiProcessCollector(MultiProcessCollector):
                 return
 
             # read all .db files and collect all samples for same metric together
-            current_metrics: dict[str, Metric] = self._read_metrics(file.name for file in files_to_merge)
+            current_metrics: dict[str, Metric] = cls._read_metrics(file.name for file in files_to_merge)
 
             # load existing merged metrics, if any
             merged_data = merged_file.read()
