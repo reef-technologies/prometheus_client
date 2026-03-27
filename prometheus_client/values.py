@@ -88,11 +88,12 @@ def MultiProcessValue(process_identifier=os.getpid):
             self._key = mmap_key(metric_name, name, labelnames, labelvalues, help_text)
             self._value, self._timestamp = self._file.read_value(self._key)
 
-            try:
-                # acquire the lock on file to prevent it from being wiped by cleanup procedure
-                fcntl.flock(self._file._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                log.exception("Could not acquire lock on metric file %s", self._file._fname)
+            if os.environ.get("PROMETHEUS_USE_FLOCK", "0") == "1":
+                try:
+                    # acquire the lock on file to prevent it from being wiped by cleanup procedure
+                    fcntl.flock(self._file._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    log.exception("Could not acquire lock on metric file %s", self._file._fname)
 
         def __check_for_pid_change(self):
             actual_pid = process_identifier()

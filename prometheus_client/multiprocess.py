@@ -40,8 +40,6 @@ def reduce_metrics(*metrics: dict[str, Metric]) -> dict[str, Metric]:
 class MultiProcessCollector:
     """Collector for files for multi-process mode."""
 
-    MERGED_METRICS_FILENAME = "merged_metrics.pkl"
-
     def __init__(self, registry, path=None):
         if path is None:
             # This deprecation warning can go away in a few releases when removing the compatibility
@@ -190,6 +188,15 @@ class MultiProcessCollector:
                 for (name_, labels), value in samples_by_labels.items():
                     metric.samples.append(Sample(name_, dict(labels), value))
         return metrics.values()
+
+    def collect(self):
+        files = glob.glob(os.path.join(self._path, '*.db'))
+        return self.merge(files, accumulate=True)
+
+
+class FlockMultiProcessCollector(MultiProcessCollector):
+
+    MERGED_METRICS_FILENAME = "merged_metrics.pkl"
 
     def collect(self, recursively: bool = True) -> ValuesView[Metric]:
         """
