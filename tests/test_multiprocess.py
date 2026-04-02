@@ -1,7 +1,12 @@
 import glob
+from itertools import chain
+from multiprocessing import Process
 import os
+from pathlib import Path
 import shutil
+import subprocess
 import tempfile
+from time import sleep
 import unittest
 import warnings
 
@@ -10,7 +15,7 @@ from prometheus_client.core import (
     CollectorRegistry, Counter, Gauge, Histogram, Sample, Summary,
 )
 from prometheus_client.multiprocess import (
-    mark_process_dead, MultiProcessCollector,
+    mark_process_dead, MultiProcessCollector, FlockMultiProcessCollector
 )
 from prometheus_client.values import (
     get_value_class, MultiProcessValue, MutexValue,
@@ -479,7 +484,7 @@ class TestMultiProcess(unittest.TestCase):
             assert "Removal of labels has not been implemented" in str(w[0].message)
             assert issubclass(w[-1].category, UserWarning)
             assert "Clearing labels has not been implemented" in str(w[-1].message)
-    
+
     def test_child_name_is_built_once_with_namespace_subsystem_unit(self):
         """
         Repro for #1035:
@@ -589,6 +594,170 @@ class TestMultiProcess(unittest.TestCase):
         self.assertEqual(child.context['namespace'], 'prod')
         self.assertEqual(child.context['subsystem'], 'api')
         self.assertEqual(child.context['unit'], 'seconds')
+
+
+def e2e_worker():
+    c = Counter('c', 'help', registry=None)
+    c.inc()
+    sleep(100)
+
+
+class TestFlockMultiProcess(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        self.multiproc_path = Path(self.tempdir)
+        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
+        os.environ['PROMETHEUS_USE_FLOCK'] = "1"
+        values.ValueClass = MultiProcessValue(lambda: 123)
+        self.registry = CollectorRegistry(support_collectors_without_names=True)
+        self.collector = FlockMultiProcessCollector(self.registry)
+
+    def tearDown(self):
+        del os.environ['PROMETHEUS_MULTIPROC_DIR']
+        del os.environ['PROMETHEUS_USE_FLOCK']
+        shutil.rmtree(self.tempdir)
+        values.ValueClass = MutexValue
+
+    def test_advisory_lock(self):
+        self.assertEqual(len(list(self.multiproc_path.glob('*.db'))), 0)
+
+        c = Counter('c', 'help', registry=None)
+        c.inc()
+        files = list(self.multiproc_path.glob('*.db'))
+        self.assertEqual(len(files), 1)
+
+        result = subprocess.run(['flock', '--exclusive', '--nonblock', str(files[0]), 'true'])
+        self.assertEqual(result.returncode, 1)
+
+        c._value._file.close()  # release the lock
+        result = subprocess.run(['flock', '--exclusive', '--nonblock', str(files[0]), 'true'])
+        self.assertEqual(result.returncode, 0)
+
+    def test_merging_metrics_files(self):
+        self.assertEqual(len(list(self.multiproc_path.glob('*'))), 0)
+
+        values.ValueClass = MultiProcessValue(lambda: 1)
+        c1 = Counter('c', 'help', registry=None)
+        c1.inc(1)
+
+        values.ValueClass = MultiProcessValue(lambda: 2)
+        c2 = Counter('c', 'help', registry=None)
+        c2.inc(2)
+        c2._value._file.close()
+        del c2
+
+        values.ValueClass = MultiProcessValue(lambda: 3)
+        c3 = Counter('c', 'help', registry=None)
+        c3.inc(3)
+        c3._value._file.close()
+        del c3
+
+        values.ValueClass = MultiProcessValue(lambda: 4)
+        c4 = Gauge('g', 'help', registry=None)
+        c4.set(4)
+        c4._value._file.close()
+        del c4
+
+        values.ValueClass = MultiProcessValue(lambda: 5)
+        c5 = Gauge('g', 'help', registry=None)
+        c5.set(5)
+
+        values.ValueClass = MultiProcessValue(lambda: 6)
+        c6 = Gauge('g', 'help', registry=None)
+        c6.set(6)
+        c6._value._file.close()
+        del c6
+
+        files = list(self.multiproc_path.glob('*'))
+        self.assertEqual(sorted(files), [
+            self.multiproc_path / 'counter_1.db',
+            self.multiproc_path / 'counter_2.db',
+            self.multiproc_path / 'counter_3.db',
+            self.multiproc_path / 'gauge_all_4.db',
+            self.multiproc_path / 'gauge_all_5.db',
+            self.multiproc_path / 'gauge_all_6.db',
+        ])
+        metrics_before = self.collector.collect()
+
+        self.collector.cleanup(self.multiproc_path)
+        files = list(self.multiproc_path.glob('*'))
+        self.assertEqual(sorted(files), [
+            self.multiproc_path / 'counter_1.db',
+            self.multiproc_path / 'gauge_all_5.db',
+            self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
+        ])
+        metrics_after = self.collector.collect()
+
+        for metric in chain(metrics_before, metrics_after):
+            metric.samples[:] = sorted(metric.samples, key=lambda s: sorted(s.labels.items()))
+        self.assertEqual(list(metrics_before), list(metrics_after))
+
+    def test_merging_merged_file(self):
+        self.assertEqual(len(list(self.multiproc_path.glob('*'))), 0)
+
+        values.ValueClass = MultiProcessValue(lambda: 1)
+        c1 = Counter('c', 'help', registry=None)
+        c1.inc(1)
+        c1._value._file.close()
+        del c1
+
+        values.ValueClass = MultiProcessValue(lambda: 2)
+        c2 = Counter('c', 'help', registry=None)
+        c2.inc(2)
+
+        self.collector.cleanup(self.multiproc_path)
+        assert (self.multiproc_path / self.collector.MERGED_METRICS_FILENAME).exists()
+
+        values.ValueClass = MultiProcessValue(lambda: 3)
+        c3 = Counter('c', 'help', registry=None)
+        c3.inc(3)
+        c3._value._file.close()
+        del c3
+
+        metrics_before = self.collector.collect()
+        self.collector.cleanup(self.multiproc_path)
+        metrics_after = self.collector.collect()
+
+        for metric in chain(metrics_before, metrics_after):
+            metric.samples[:] = sorted(metric.samples, key=lambda s: sorted(s.labels.items()))
+        self.assertEqual(list(metrics_before), list(metrics_after))
+        self.assertEqual(sorted(self.multiproc_path.glob('*')), [
+            self.multiproc_path / 'counter_2.db',
+            self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
+        ])
+
+    def test_collection_e2e(self):
+        NUM_PROCESSES = 5
+        NUM_ALIVE_PROCESSES = 3
+
+        processes = [Process(target=e2e_worker) for _ in range(NUM_PROCESSES)]
+        for p in processes:
+            p.start()
+
+        sleep(2)
+
+        # current process is a collector
+        files = list(self.multiproc_path.glob('*.db'))
+        self.assertEqual(len(files), NUM_PROCESSES)
+
+        metrics_before = self.collector.collect()
+        for p in processes[NUM_ALIVE_PROCESSES:]:
+            p.terminate()
+        sleep(2)
+
+        assert len(list(self.multiproc_path.glob('*.db'))) == NUM_PROCESSES
+        self.collector.cleanup(self.multiproc_path)
+        files = list(self.multiproc_path.glob('*.db'))
+        self.assertEqual(len(files), NUM_ALIVE_PROCESSES)
+        self.assertTrue((self.multiproc_path / self.collector.MERGED_METRICS_FILENAME).exists())
+        metrics_after = self.collector.collect()
+
+        for metric in chain(metrics_before, metrics_after):
+            metric.samples[:] = sorted(metric.samples, key=lambda s: sorted(s.labels.items()))
+        self.assertEqual(list(metrics_before), list(metrics_after))
+
+        for p in processes[:NUM_ALIVE_PROCESSES]:
+            p.terminate()
 
 
 class TestMmapedDict(unittest.TestCase):
