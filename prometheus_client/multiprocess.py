@@ -195,6 +195,23 @@ class MultiProcessCollector:
 
 
 class FlockMultiProcessCollector(MultiProcessCollector):
+    """
+    Multiprocess collector with flock-based stale file cleanup.
+
+    Live processes keep per-metric .db files open with an exclusive flock.
+    cleanup() merges .db files it can lock (closed / dead processes) into
+    merged_metrics.pkl and deletes them. collect() reads live .db files plus
+    merged_metrics.pkl.
+
+    With multiple gunicorn workers serving /metrics, cleanup() in one worker
+    and collect() in another can race: collect() may glob a .db file, then
+    cleanup() merges and deletes it before collect() reads it, while collect()
+    already read a stale merged_metrics.pkl. The shared flock on
+    merged_metrics.pkl prevents that: collect() holds LOCK_SH for the whole
+    read (glob .db, read .db, read merged), so cleanup() cannot acquire
+    LOCK_EX until the scrape finishes. cleanup() uses LOCK_EX | LOCK_NB and
+    skips when a scrape is in progress.
+    """
 
     MERGED_METRICS_FILENAME = "merged_metrics.pkl"
 
@@ -203,14 +220,24 @@ class FlockMultiProcessCollector(MultiProcessCollector):
         Collect metrics from all .db files, merge them with existing merged metrics and return the result.
         """
         folder = Path(self._path)
-        current_metrics: dict[str, Metric] = self._read_metrics(str(file) for file in folder.glob('**/*.db' if recursively else '*.db'))
-        merged_metrics: list[dict[str, Metric]] = [
-            pickle.loads(data)
-            for file in folder.glob(f"**/{self.MERGED_METRICS_FILENAME}" if recursively else self.MERGED_METRICS_FILENAME)
-            if (data := file.read_bytes())
-        ]
+        merged_file_path = folder / self.MERGED_METRICS_FILENAME
+        merged_file_path.touch(exist_ok=True)
+        with merged_file_path.open("rb") as merged_file:
+            fcntl.flock(merged_file, fcntl.LOCK_SH)
+            try:
+                current_metrics: dict[str, Metric] = self._read_metrics(
+                    str(file) for file in folder.glob('**/*.db' if recursively else '*.db')
+                )
+                merged_file.seek(0)
+                merged_data = merged_file.read()
+                try:
+                    merged_metrics = pickle.loads(merged_data) if merged_data else {}
+                except (pickle.PickleError, EOFError):
+                    merged_metrics = {}
+            finally:
+                fcntl.flock(merged_file, fcntl.LOCK_UN)
 
-        reduced_metrics = reduce_metrics(current_metrics, *merged_metrics)
+        reduced_metrics = reduce_metrics(current_metrics, merged_metrics)
         return self._accumulate_metrics(reduced_metrics, accumulate=True)
 
     @classmethod
