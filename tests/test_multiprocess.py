@@ -1,4 +1,5 @@
 import glob
+import inspect
 from itertools import chain
 from multiprocessing import Process
 import os
@@ -6,8 +7,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from threading import Event, Thread
 from time import sleep
 import unittest
+from unittest.mock import patch
 import warnings
 
 from prometheus_client import mmap_dict, values
@@ -723,6 +726,159 @@ class TestFlockMultiProcess(unittest.TestCase):
         self.assertEqual(list(metrics_before), list(metrics_after))
         self.assertEqual(sorted(self.multiproc_path.glob('*')), [
             self.multiproc_path / 'counter_2.db',
+            self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
+        ])
+
+    def test_collect_during_cleanup(self):
+        """
+        Two metrics files, one locked, other not (as if the process died).
+        `_read_metrics` is patched to pause, and then we run `cleanup()` and `collect()`
+        so that `cleanup()` holds the LOCK_EX and thus `collect()` waits.
+        In the end ensure that 1) files are cleaned up correctly and
+        2) `collect()` returns correct values
+        """
+
+        values.ValueClass = MultiProcessValue(lambda: 1)
+        c_live = Counter('c', 'help', registry=None)
+        c_live.inc(5)
+
+        values.ValueClass = MultiProcessValue(lambda: 2)
+        c_dead = Counter('c', 'help', registry=None)
+        c_dead.inc(3)
+        c_dead._value._file.close()
+        del c_dead
+
+        real_read_metrics = FlockMultiProcessCollector._read_metrics
+        cleanup_ready_to_read = Event()
+        collect_started = Event()
+        resume_cleanup = Event()
+        collect_done = Event()
+        collected_metrics = None
+
+        def slow_read_metrics(files):
+            paths = list(files)
+            caller = next(
+                frame.function
+                for frame in inspect.stack()
+                if frame.function in ('cleanup', 'collect')
+            )
+            if caller == 'cleanup':
+                cleanup_ready_to_read.set()
+                collect_started.wait()
+                resume_cleanup.wait()
+            return real_read_metrics(paths)
+
+        def run_collect():
+            nonlocal collected_metrics
+            collect_started.set()
+            collected_metrics = list(self.collector.collect())
+            collect_done.set()
+            return collected_metrics
+
+        with patch.object(
+            FlockMultiProcessCollector,
+            '_read_metrics',
+            staticmethod(slow_read_metrics),
+        ):
+            cleanup_thread = Thread(
+                target=self.collector.cleanup,
+                args=(self.multiproc_path,),
+            )
+            cleanup_thread.start()
+            cleanup_ready_to_read.wait()
+
+            collect_thread = Thread(target=run_collect)
+            collect_thread.start()
+            collect_started.wait()
+            self.assertFalse(collect_done.wait(timeout=1))
+
+            resume_cleanup.set()
+            cleanup_thread.join()
+            collect_done.wait()
+            collect_thread.join()
+
+        self.assertEqual(sorted(self.multiproc_path.glob('*')), [
+            self.multiproc_path / 'counter_1.db',
+            self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
+        ])
+        metrics = {m.name: m for m in collected_metrics}
+        self.assertEqual(metrics['c'].samples, [Sample('c_total', {}, 8.0)])
+
+    def test_cleanup_during_collect(self):
+        """
+        `_read_metrics` is patched to pause `collect()` while it holds LOCK_SH.
+        `cleanup()` is started during that window and must skip immediately.
+        After `collect()` finishes, `cleanup()` merges stale files correctly.
+        """
+
+        values.ValueClass = MultiProcessValue(lambda: 1)
+        c_live = Counter('c', 'help', registry=None)
+        c_live.inc(5)
+
+        values.ValueClass = MultiProcessValue(lambda: 2)
+        c_dead = Counter('c', 'help', registry=None)
+        c_dead.inc(3)
+        c_dead._value._file.close()
+        del c_dead
+
+        real_read_metrics = FlockMultiProcessCollector._read_metrics
+        collect_ready_to_read = Event()
+        resume_collect = Event()
+        collect_done = Event()
+        cleanup_done = Event()
+        collected_metrics = None
+
+        def slow_read_metrics(files):
+            paths = list(files)
+            caller = next(
+                frame.function
+                for frame in inspect.stack()
+                if frame.function in ('cleanup', 'collect')
+            )
+            if caller == 'collect':
+                collect_ready_to_read.set()
+                resume_collect.wait()
+            return real_read_metrics(paths)
+
+        def run_collect():
+            nonlocal collected_metrics
+            collected_metrics = list(self.collector.collect())
+            collect_done.set()
+
+        def run_cleanup():
+            self.collector.cleanup(self.multiproc_path)
+            cleanup_done.set()
+
+        with patch.object(
+            FlockMultiProcessCollector,
+            '_read_metrics',
+            staticmethod(slow_read_metrics),
+        ):
+            collect_thread = Thread(target=run_collect)
+            collect_thread.start()
+            collect_ready_to_read.wait()
+
+            cleanup_thread = Thread(target=run_cleanup)
+            cleanup_thread.start()
+            cleanup_done.wait(timeout=1)
+            cleanup_thread.join()
+
+            self.assertEqual(sorted(self.multiproc_path.glob('*')), [
+                self.multiproc_path / 'counter_1.db',
+                self.multiproc_path / 'counter_2.db',
+                self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
+            ])
+
+            resume_collect.set()
+            collect_done.wait()
+            collect_thread.join()
+
+        metrics = {m.name: m for m in collected_metrics}
+        self.assertEqual(metrics['c'].samples, [Sample('c_total', {}, 8.0)])
+
+        self.collector.cleanup(self.multiproc_path)
+        self.assertEqual(sorted(self.multiproc_path.glob('*')), [
+            self.multiproc_path / 'counter_1.db',
             self.multiproc_path / self.collector.MERGED_METRICS_FILENAME,
         ])
 
